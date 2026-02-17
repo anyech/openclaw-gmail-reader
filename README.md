@@ -113,6 +113,20 @@ openclaw-gmail-reader/
 └── .gitignore
 ```
 
+## Optional Utilities
+
+### Drive Indexer (Optional)
+
+For tracking Google Drive file changes:
+
+```python
+# Copy drive_indexer.py to your project
+# Requires: same credentials setup
+python drive_indexer.py
+```
+
+This builds an index and detects new files between runs.
+
 ## License
 
 MIT
