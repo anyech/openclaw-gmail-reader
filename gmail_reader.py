@@ -2,13 +2,27 @@
 """
 OpenClaw Gmail Reader
 A Python library for reading and sending emails via Gmail API.
+
+Usage:
+    # As a library
+    from gmail_reader import GmailReader
+    reader = GmailReader()
+    emails = reader.fetch_emails()
+    
+    # CLI
+    python gmail_reader.py --max 20           # Fetch last 20 emails
+    python gmail_reader.py --send user@x.com  # Send test email
+    python gmail_reader.py --summary          # Generate OpenClaw summary
 """
 
 import os
 import json
 import base64
+import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
+from email.mime.text import MIMEText
+
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -23,6 +37,7 @@ DEFAULT_SCOPES = [
 
 DEFAULT_CREDENTIALS_FILE = Path(__file__).parent / 'credentials' / 'client_secrets.json'
 DEFAULT_TOKEN_FILE = Path(__file__).parent / 'credentials' / 'token.json'
+DEFAULT_MEMORY_FILE = Path(__file__).parent / '..' / 'memory' / 'gmail-daily.md'
 
 
 class GmailReader:
@@ -118,16 +133,39 @@ class GmailReader:
             # Get snippet
             snippet = email_data.get('snippet', '')
             
+            # Get body (for full content)
+            body = self._get_body(email_data)
+            
             emails.append({
                 'id': msg['id'],
                 'sender': sender,
                 'subject': subject,
                 'date': date,
                 'snippet': snippet,
+                'body': body,
                 'labels': email_data.get('labelIds', [])
             })
         
         return emails
+    
+    def _get_body(self, email_data):
+        """Extract body text from email data."""
+        payload = email_data.get('payload', {})
+        body = ""
+        
+        if 'parts' in payload:
+            for part in payload['parts']:
+                if part['mimeType'] == 'text/plain':
+                    data = part['body'].get('data', '')
+                    if data:
+                        body = base64.urlsafe_b64decode(data).decode('utf-8', errors='replace')
+                        break
+        else:
+            data = payload.get('body', {}).get('data', '')
+            if data:
+                body = base64.urlsafe_b64decode(data).decode('utf-8', errors='replace')
+        
+        return body[:500] + "..." if len(body) > 500 else body
     
     def categorize_priority(self, email):
         """
@@ -165,8 +203,6 @@ class GmailReader:
         Returns:
             Message ID on success
         """
-        from email.mime.text import MIMEText
-        
         service = self.connect()
         
         message = MIMEText(body)
@@ -188,15 +224,45 @@ class GmailReader:
         """Get Gmail profile info."""
         service = self.connect()
         return service.users().getProfile(userId='me').execute()
+    
+    def format_for_analysis(self, emails):
+        """Format emails for OpenClaw analysis."""
+        if not emails:
+            return f"## Gmail Summary ({datetime.now().strftime('%Y-%m-%d %H:%M UTC')})\n\n**No emails in the last 24 hours.**"
+        
+        output = f"## Gmail Summary ({datetime.now().strftime('%Y-%m-%d %H:%M UTC')})\n\n"
+        output += f"**Total emails (last 24h):** {len(emails)}\n\n"
+        
+        for i, email in enumerate(emails, 1):
+            output += f"### Email {i}\n"
+            output += f"**From:** {email['sender']}\n"
+            output += f"**Subject:** {email['subject']}\n"
+            output += f"**Date:** {email['date']}\n"
+            preview = email.get('body', email.get('snippet', ''))[:200]
+            output += f"**Preview:** {preview}...\n\n"
+        
+        return output
+    
+    def log_emails(self, emails, memory_file=None):
+        """Log emails to memory file for OpenClaw."""
+        memory_file = memory_file or DEFAULT_MEMORY_FILE
+        memory_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(memory_file, 'a', encoding='utf-8') as f:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+            f.write(f"\n## Gmail Check - {timestamp}\n")
+            f.write(f"Emails processed: {len(emails)}\n")
+            for email in emails:
+                f.write(f"- [{email['date']}] {email['sender']}: {email['subject']}\n")
+            f.write("\n")
 
 
 def main():
-    """CLI entry point for quick testing."""
-    import argparse
-    
+    """CLI entry point."""
     parser = argparse.ArgumentParser(description='OpenClaw Gmail Reader')
-    parser.add_argument('--max', type=int, default=10, help='Max emails to fetch')
-    parser.add_argument('--send', type=str, help='Send test email to address')
+    parser.add_argument('--max', type=int, default=100, help='Max emails to fetch')
+    parser.add_argument('--send', type=str, metavar='EMAIL', help='Send test email to address')
+    parser.add_argument('--summary', action='store_true', help='Generate OpenClaw summary and log')
     args = parser.parse_args()
     
     reader = GmailReader()
@@ -208,7 +274,26 @@ def main():
             body="This is a test email sent via the Gmail API."
         )
         print(f"Email sent! ID: {msg_id}")
+    elif args.summary:
+        # OpenClaw morning memo mode
+        print("Fetching all emails from last 24 hours...")
+        emails = reader.fetch_emails(max_results=args.max)
+        
+        summary = reader.format_for_analysis(emails)
+        reader.log_emails(emails)
+        
+        # Save summary for OpenClaw to read
+        summary_file = Path(__file__).parent / 'latest_summary.md'
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            f.write(summary)
+        
+        print(f"\n{'='*60}")
+        print(summary)
+        print(f"{'='*60}")
+        print(f"\nSummary saved to: {summary_file}")
+        print(f"Activity logged to: {DEFAULT_MEMORY_FILE}")
     else:
+        # Default: fetch and display
         emails = reader.fetch_emails(max_results=args.max)
         print(f"=== Fetched {len(emails)} emails ===\n")
         
