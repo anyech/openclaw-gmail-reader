@@ -1,136 +1,107 @@
-# OpenClaw Gmail Reader
+# Gmail Reader
 
-A Python library for reading and sending emails via Gmail API, designed for OpenClaw integration.
+Python-based Gmail API integration for OpenClaw.
 
-## Features
+## Setup
 
-- **Read emails** from Gmail with priority categorization
-- **Send emails** with full Gmail API support
-- **OAuth 2.0** authentication (secure, no password storage)
-- **Cron-friendly** — run on schedule for daily summaries
+1. OAuth credentials in `credentials/client_secrets.json`
+2. Token stored in `credentials/token.json`
 
-## Installation
+## APIs Enabled
 
-```bash
-git clone https://github.com/anyech/openclaw-gmail-reader.git
-cd openclaw-gmail-reader
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
+- Gmail: Read + Send
+- Google Calendar: Read-only
+- Google Drive: Read-only
+- Google Sheets: Read-only
 
-## Google Cloud Setup
+## OAuth Token Setup (VPS/Headless)
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/apis/credentials)
-2. Create a new project or select existing
-3. Enable **Gmail API**
-4. Create OAuth credentials:
-   - Application type: **Web application**
-   - Add redirect URIs:
-     - `http://localhost`
-     - `https://developers.google.com/oauthplayground`
-5. Download credentials as `credentials/client_secrets.json`
+The `gmail_reader.py` uses `flow.run_local_server()` which requires a browser. For VPS environments, use manual OAuth flow with OAuth Playground:
 
-## Initial OAuth Setup
-
-Run the setup script to authorize:
+### Step 1: Generate Authorization URL
 
 ```bash
-python setup.py
+cd ~/.openclaw/workspace/gmail-reader
+python3 -c "
+from urllib.parse import quote
+client_id = 'YOUR_CLIENT_ID'  # From client_secrets.json
+scopes = 'gmail.readonly gmail.send calendar.readonly drive.readonly spreadsheets.readonly'
+scope_url = 'https://www.googleapis.com/auth/' + '+https://www.googleapis.com/auth/'.join(scopes.split())
+redirect_uri = 'https://developers.google.com/oauthplayground'
+
+url = f'https://accounts.google.com/o/oauth2/v2/auth?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope={scope_url}&access_type=offline&prompt=consent'
+print(url)
+"
 ```
 
-Or use OAuth Playground:
-1. Go to [OAuth Playground](https://developers.google.com/oauthplayground)
-2. Use your Client ID/Secret
-3. Scope: `https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send`
-4. Exchange for tokens
-5. Save as `credentials/token.json`
+### Step 2: Authorize in Browser
+
+1. Visit the generated URL
+2. Sign in and authorize all requested scopes
+3. You'll be redirected to OAuth Playground with `?code=...` in the URL
+
+### Step 3: Exchange Code for Token
+
+```bash
+python3 << 'EOF'
+import requests
+import json
+from pathlib import Path
+
+# Get client credentials
+creds_file = Path('credentials/client_secrets.json')
+with open(creds_file) as f:
+    creds = json.load(f)['web']
+
+# Paste your authorization code here
+auth_code = 'YOUR_AUTH_CODE'  # From OAuth Playground redirect URL
+
+# Exchange code for token
+response = requests.post('https://oauth2.googleapis.com/token', data={
+    'code': auth_code,
+    'client_id': creds['client_id'],
+    'client_secret': creds['client_secret'],
+    'redirect_uri': 'https://developers.google.com/oauthplayground',
+    'grant_type': 'authorization_code'
+})
+
+token_data = response.json()
+token_data['client_id'] = creds['client_id']
+token_data['client_secret'] = creds['client_secret']
+
+# Save token
+with open('credentials/token.json', 'w') as f:
+    json.dump(token_data, f)
+
+print(f"Token saved with scopes: {token_data.get('scope', 'unknown')}")
+EOF
+```
 
 ## Usage
 
-### Read Emails
-
-```python
-from gmail_reader import GmailReader
-
-reader = GmailReader()
-emails = reader.fetch_emails(max_results=50)
-
-for email in emails:
-    print(f"{email['sender']}: {email['subject']}")
-```
-
-### Send Email
-
-```python
-from gmail_reader import GmailReader
-
-reader = GmailReader()
-reader.send_email(
-    to="recipient@example.com",
-    subject="Test",
-    body="Hello from Gmail Reader!"
-)
-```
-
-### Use with OpenClaw Cron
-
-Add to your cron job:
-
 ```bash
-cd /path/to/openclaw-gmail-reader && \
-source venv/bin/activate && \
+source venv/bin/activate
 python gmail_reader.py
 ```
 
-## Configuration
-
-| File | Description |
-|------|-------------|
-| `credentials/client_secrets.json` | OAuth client credentials |
-| `credentials/token.json` | Access/refresh tokens |
-
-Both are in `.gitignore` — never commit to version control.
-
-## Scope Options
-
-| Scope | Permission |
-|-------|------------|
-| `gmail.readonly` | Read only |
-| `gmail.send` | Send only |
-| Both | Read + Send |
-
-## File Structure
+## Scopes
 
 ```
-openclaw-gmail-reader/
-├── gmail_reader.py     # Main library
-├── requirements.txt    # Dependencies
-├── setup.py           # OAuth setup helper
-├── credentials/       # OAuth files (not committed)
-│   ├── client_secrets.json
-│   └── token.json
-└── .gitignore
+https://www.googleapis.com/auth/gmail.readonly
+https://www.googleapis.com/auth/gmail.send
+https://www.googleapis.com/auth/calendar.readonly
+https://www.googleapis.com/auth/drive.readonly
+https://www.googleapis.com/auth/spreadsheets.readonly
 ```
 
-## Optional Utilities
+## Token Refresh
 
-### Drive Indexer (Optional)
+- **Access tokens** expire in ~1 hour, auto-refreshed by `gmail_reader.py`
+- **Refresh tokens** last 6 months of inactivity (app is published to production)
+- If refresh token expires, repeat the OAuth flow above
 
-For tracking Google Drive file changes:
+## Security
 
-```python
-# Copy drive_indexer.py to your project
-# Requires: same credentials setup
-python drive_indexer.py
-```
-
-This builds an index and detects new files between runs.
-
-## License
-
-MIT
-
-## Author
-
-OpenClaw Community
+- `credentials/` directory is `.gitignore`'d
+- OAuth tokens not committed
+- Client secrets configured for OAuth Playground redirect URI
