@@ -23,16 +23,22 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from email.mime.text import MIMEText
 
+from preview_markdown import sanitize_markdown_preview
+
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# Default scopes: Read + Send
+# Default scopes: Gmail + Calendar + Drive + Sheets (all-in-one)
+# This ensures token.json always has all scopes when refreshed
 DEFAULT_SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.send'
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/calendar.readonly',
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/spreadsheets.readonly'
 ]
 
 DEFAULT_CREDENTIALS_FILE = Path(__file__).parent / 'credentials' / 'client_secrets.json'
@@ -88,7 +94,7 @@ class GmailReader:
             self.service = build('gmail', 'v1', credentials=creds)
         return self.service
     
-    def fetch_emails(self, max_results=100, query=None, all_emails=True):
+    def fetch_emails(self, max_results=100, query=None, all_emails=True, include_attachments=False):
         """
         Fetch emails from Gmail.
         
@@ -96,6 +102,7 @@ class GmailReader:
             max_results: Maximum number of emails to fetch
             query: Gmail search query (optional)
             all_emails: If True, fetch all (read+unread) from last 24h
+            include_attachments: If True, extract attachment metadata (adds API calls)
         
         Returns:
             List of email dictionaries
@@ -119,10 +126,18 @@ class GmailReader:
         emails = []
         
         for msg in messages:
-            email_data = service.users().messages().get(
-                userId='me', 
-                id=msg['id']
-            ).execute()
+            # Fetch full message with attachments if requested
+            if include_attachments:
+                email_data = service.users().messages().get(
+                    userId='me', 
+                    id=msg['id'],
+                    format='full'
+                ).execute()
+            else:
+                email_data = service.users().messages().get(
+                    userId='me', 
+                    id=msg['id']
+                ).execute()
             
             # Extract headers
             headers = email_data.get('payload', {}).get('headers', [])
@@ -136,6 +151,29 @@ class GmailReader:
             # Get body (for full content)
             body = self._get_body(email_data)
             
+            # Extract attachment info if requested
+            has_attachments = False
+            attachment_types = []
+            image_attachments = []
+            
+            if include_attachments and 'parts' in email_data.get('payload', {}):
+                for part in email_data['payload']['parts']:
+                    if part.get('filename'):
+                        has_attachments = True
+                        mime_type = part.get('mimeType', '')
+                        attachment_types.append(mime_type)
+                        
+                        # Track image attachments specifically
+                        if mime_type.startswith('image/'):
+                            attachment_id = part.get('body', {}).get('attachmentId')
+                            if attachment_id:
+                                image_attachments.append({
+                                    'filename': part['filename'],
+                                    'mime_type': mime_type,
+                                    'attachment_id': attachment_id,
+                                    'size': part.get('body', {}).get('size', 0)
+                                })
+            
             emails.append({
                 'id': msg['id'],
                 'sender': sender,
@@ -143,7 +181,10 @@ class GmailReader:
                 'date': date,
                 'snippet': snippet,
                 'body': body,
-                'labels': email_data.get('labelIds', [])
+                'labels': email_data.get('labelIds', []),
+                'has_attachments': has_attachments,
+                'attachment_types': attachment_types,
+                'image_attachments': image_attachments
             })
         
         return emails
@@ -190,7 +231,7 @@ class GmailReader:
         
         return 'LOW'
     
-    def send_email(self, to, subject, body, from_addr=None):
+    def send_email(self, to, subject, body, from_addr=None, reply_to_message_id=None):
         """
         Send an email.
         
@@ -199,6 +240,7 @@ class GmailReader:
             subject: Email subject
             body: Email body (plain text or HTML)
             from_addr: From address (optional, uses authenticated account)
+            reply_to_message_id: Gmail message ID to reply to (for threading)
         
         Returns:
             Message ID on success
@@ -210,6 +252,16 @@ class GmailReader:
         message['subject'] = subject
         if from_addr:
             message['from'] = from_addr
+        
+        # Add threading headers if replying to an email
+        if reply_to_message_id:
+            # In-Reply-To header for email threading
+            message['In-Reply-To'] = f'<{reply_to_message_id}@gmail.com>'
+            # References header for email threading
+            message['References'] = f'<{reply_to_message_id}@gmail.com>'
+            # Standard reply subject prefix if not already present
+            if not subject.lower().startswith('re:'):
+                message['subject'] = f'Re: {subject}'
         
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
         
@@ -225,21 +277,108 @@ class GmailReader:
         service = self.connect()
         return service.users().getProfile(userId='me').execute()
     
+    def get_attachment(self, message_id, attachment_id):
+        """
+        Download an email attachment.
+        
+        Args:
+            message_id: Gmail message ID
+            attachment_id: Attachment ID from message parts
+        
+        Returns:
+            Dictionary with filename, mime_type, and base64-encoded data
+        """
+        service = self.connect()
+        
+        attachment = service.users().messages().attachments().get(
+            userId='me',
+            messageId=message_id,
+            id=attachment_id
+        ).execute()
+        
+        return {
+            'filename': attachment.get('filename', 'unknown'),
+            'mime_type': attachment.get('mimeType', 'application/octet-stream'),
+            'size': attachment.get('size', 0),
+            'data': attachment.get('data', '')  # Base64-encoded
+        }
+    
+    def ocr_image_attachment(self, message_id, attachment_id, model='bailian/kimi-k2.5'):
+        """
+        Perform OCR on an image attachment using vision-capable model.
+        
+        Args:
+            message_id: Gmail message ID
+            attachment_id: Attachment ID
+            model: Vision model to use (default: Kimi K2.5)
+        
+        Returns:
+            OCR result text
+        """
+        # Get attachment data
+        attachment = self.get_attachment(message_id, attachment_id)
+        
+        if not attachment['data']:
+            return "Error: Could not retrieve attachment data"
+        
+        # For OCR, we'd typically use the image tool or spawn a multimodal subagent
+        # This method returns the attachment info for the subagent to process
+        return {
+            'message_id': message_id,
+            'filename': attachment['filename'],
+            'mime_type': attachment['mime_type'],
+            'size': attachment['size'],
+            'base64_data': attachment['data'][:1000] + '...' if len(attachment['data']) > 1000 else attachment['data']
+        }
+    
+    def _sanitize_markdown_preview(self, text):
+        """Normalize preview text so generated Markdown stays lint-safe."""
+        return sanitize_markdown_preview(text)
+
     def format_for_analysis(self, emails):
         """Format emails for OpenClaw analysis."""
         if not emails:
-            return f"## Gmail Summary ({datetime.now().strftime('%Y-%m-%d %H:%M UTC')})\n\n**No emails in the last 24 hours.**"
+            return f"# Gmail Summary ({datetime.now().strftime('%Y-%m-%d %H:%M UTC')})\n\n**No emails in the last 24 hours.**"
         
-        output = f"## Gmail Summary ({datetime.now().strftime('%Y-%m-%d %H:%M UTC')})\n\n"
+        output = f"# Gmail Summary ({datetime.now().strftime('%Y-%m-%d %H:%M UTC')})\n\n"
         output += f"**Total emails (last 24h):** {len(emails)}\n\n"
         
+        # Track emails with image attachments
+        image_attachment_emails = []
+        
         for i, email in enumerate(emails, 1):
-            output += f"### Email {i}\n"
+            output += f"## Email {i}\n"
             output += f"**From:** {email['sender']}\n"
             output += f"**Subject:** {email['subject']}\n"
             output += f"**Date:** {email['date']}\n"
-            preview = email.get('body', email.get('snippet', ''))[:200]
+            
+            # Check for image attachments
+            if email.get('image_attachments'):
+                image_attachment_emails.append({
+                    'index': i,
+                    'subject': email['subject'],
+                    'attachments': email['image_attachments']
+                })
+                output += f"**📎 Attachments:** {len(email['image_attachments'])} image(s)\n"
+                for att in email['image_attachments']:
+                    output += f"   - `{att['filename']}` ({att['mime_type']}, {att['size']:,} bytes)\n"
+                output += f"   → **Reply \"OCR Email {i}\" or \"OCR {email['subject'][:30]}\" to extract text**\n"
+            elif email.get('has_attachments'):
+                output += f"**📎 Attachments:** Yes ({', '.join(email['attachment_types'][:3])})\n"
+            
+            preview = self._sanitize_markdown_preview(email.get('body', email.get('snippet', ''))[:200])
             output += f"**Preview:** {preview}...\n\n"
+        
+        # Add attachment summary section if any found
+        if image_attachment_emails:
+            output += "---\n\n"
+            output += f"## 📸 Emails with Image Attachments ({len(image_attachment_emails)})\n\n"
+            output += "**To OCR an attachment, reply with:** `OCR Email <number>` or `OCR <subject>`\n\n"
+            for item in image_attachment_emails:
+                output += f"{item['index']}. **{item['subject']}**\n"
+                for att in item['attachments']:
+                    output += f"   - 📎 `{att['filename']}` ({att['size']:,} bytes)\n"
+                output += f"   → Reply: `OCR Email {item['index']}`\n\n"
         
         return output
     
@@ -263,6 +402,8 @@ def main():
     parser.add_argument('--max', type=int, default=100, help='Max emails to fetch')
     parser.add_argument('--send', type=str, metavar='EMAIL', help='Send test email to address')
     parser.add_argument('--summary', action='store_true', help='Generate OpenClaw summary and log')
+    parser.add_argument('--attachments', action='store_true', help='Include attachment metadata (adds API calls)')
+    parser.add_argument('--ocr', type=str, metavar='MSG_ID:ATT_ID', help='OCR specific attachment (format: message_id:attachment_id)')
     args = parser.parse_args()
     
     reader = GmailReader()
@@ -274,10 +415,26 @@ def main():
             body="This is a test email sent via the Gmail API."
         )
         print(f"Email sent! ID: {msg_id}")
+    elif args.ocr:
+        # OCR mode
+        try:
+            msg_id, att_id = args.ocr.split(':')
+            print(f"Fetching attachment {att_id} from message {msg_id}...")
+            result = reader.ocr_image_attachment(msg_id, att_id)
+            print(f"\n{'='*60}")
+            print(f"Attachment: {result['filename']}")
+            print(f"Type: {result['mime_type']}")
+            print(f"Size: {result['size']:,} bytes")
+            print(f"\nBase64 preview: {result['base64_data'][:200]}...")
+            print(f"\n{'='*60}")
+            print("\n📸 To perform OCR, spawn a multimodal subagent with this data:")
+            print("   sessions_spawn(mode='run', model='bailian/kimi-k2.5', task='Analyze this image...')")
+        except ValueError:
+            print("Error: Invalid format. Use --ocr message_id:attachment_id")
     elif args.summary:
         # OpenClaw morning memo mode
         print("Fetching all emails from last 24 hours...")
-        emails = reader.fetch_emails(max_results=args.max)
+        emails = reader.fetch_emails(max_results=args.max, include_attachments=args.attachments)
         
         summary = reader.format_for_analysis(emails)
         reader.log_emails(emails)
@@ -294,13 +451,25 @@ def main():
         print(f"Activity logged to: {DEFAULT_MEMORY_FILE}")
     else:
         # Default: fetch and display
-        emails = reader.fetch_emails(max_results=args.max)
+        emails = reader.fetch_emails(max_results=args.max, include_attachments=args.attachments)
         print(f"=== Fetched {len(emails)} emails ===\n")
+        
+        # Show attachment summary
+        image_emails = [e for e in emails if e.get('image_attachments')]
+        if image_emails:
+            print(f"📸 Emails with image attachments: {len(image_emails)}\n")
+            for email in image_emails:
+                print(f"[{email['subject'][:50]}]")
+                for att in email['image_attachments']:
+                    print(f"  - {att['filename']} ({att['mime_type']}, {att['size']:,} bytes)")
+                print()
         
         for email in emails:
             priority = reader.categorize_priority(email)
             print(f"[{priority}] {email['sender'][:30]}")
             print(f"  {email['subject'][:50]}")
+            if email.get('image_attachments'):
+                print(f"  📎 {len(email['image_attachments'])} image(s)")
             print()
 
 

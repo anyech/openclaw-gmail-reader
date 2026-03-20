@@ -36,7 +36,7 @@ For VPS environments without a browser, use the manual OAuth flow with OAuth Pla
 ### Quick Setup
 
 ```bash
-cd ~/.openclaw/workspace/gmail-reader
+cd ~/openclaw-gmail-reader
 
 # Step 1: Generate authorization URL
 python3 manual_oauth.py
